@@ -1,0 +1,59 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.env/
+.envrc/
+
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Data & outputs (generated)
+# =========================
+data/
+logs/
+checkpoints/
+plots/
+*.npy
+
+# =========================
+# Config secrets (if any)
+# =========================
+config_local.yaml
+
+# =========================
+# Build / cache
+# =========================
+*.egg-info/
+dist/
+build/
+.cache/
+
+# =========================
+# Training artifacts
+# =========================
+*.pt
+*.pth
+*.ckpt
+
+# others
+._*
