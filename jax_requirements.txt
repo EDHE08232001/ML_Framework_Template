@@ -1,0 +1,8 @@
+jax>=0.4.20
+jaxlib>=0.4.20
+flax>=0.7.5
+optax>=0.1.7
+numpy>=1.26.4
+PyYAML>=6.0.1
+matplotlib>=3.8.2
+tensorflow>=2.14.0
