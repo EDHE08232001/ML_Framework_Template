@@ -1,22 +1,22 @@
 # PyTorch vs JAX: Template Comparison Guide
 
 ## Overview
-This document explains the key differences between the PyTorch template and the JAX template, useful for understanding two different paradigms in deep learning.
+This document breaks down the key architectural differences between PyTorch and JAX. Building a strong intuition for both imperative (PyTorch) and functional (JAX) paradigms is a massive asset for technical interviews and gives you the flexibility to choose the right tool for different machine learning pipelines.
 
 ---
 
 ## 1. **Paradigm Difference**
 
 ### PyTorch
-- **Imperative & Stateful**: Models are classes with mutable state
-- **Object-Oriented**: Neural networks are objects with `forward()` methods
-- **Eager Execution**: Operations execute immediately
+- **Imperative & Stateful**: Models are classes with mutable state.
+- **Object-Oriented**: Neural networks are objects with `forward()` methods.
+- **Eager Execution**: Operations execute immediately line-by-line (highly debuggable).
 
 ### JAX
-- **Functional & Immutable**: Pure functions, no mutable state
-- **Functional Programming**: Models composed as functions
-- **JIT Compilation**: Can compile to static graphs for performance
-- **Composable Transformations**: `grad`, `vmap`, `pmap` for derivatives, vectorization
+- **Functional & Immutable**: Pure functions, absolutely no mutable state.
+- **Functional Programming**: Models and training steps are composed as pure functions.
+- **JIT Compilation**: Compiles your Python functions into highly optimized static XLA graphs.
+- **Composable Transformations**: `grad` (derivatives), `vmap` (vectorization), `pmap` (parallelization).
 
 ---
 
@@ -38,9 +38,11 @@ class MLP(nn.Module):
         if self.dropout.p > 0:
             x = self.dropout(x)
         return self.fc2(x)
+
 ```
 
 ### JAX (with Flax)
+
 ```python
 class MLP(nn.Module):
     input_dim: int = 784
@@ -57,242 +59,199 @@ class MLP(nn.Module):
             x = nn.Dropout(rate=self.dropout, deterministic=not training)(x)
         x = nn.Dense(self.output_dim)(x)
         return x
+
 ```
 
 **Key differences:**
-- JAX uses `@nn.compact` decorator (modern Flax pattern)
-- No explicit layer storage; layers are functional
-- Training mode is a parameter, not layer state
+
+* JAX/Flax uses the `@nn.compact` decorator for inline submodule definition.
+* Layers in JAX don't hold their own weights; they are purely mathematical transformations.
 
 ---
 
-## 3. **Initialization**
+## 3. **Initialization & State**
 
 ### PyTorch
+
 ```python
-model = MLP(input_dim=784, hidden_dim=256, output_dim=10, dropout=0.0)
-model = model.to(device)
+model = MLP(input_dim=784, hidden_dim=256, output_dim=10, dropout=0.0).to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
+
 ```
 
 ### JAX
+
 ```python
 model = MLP(input_dim=784, hidden_dim=256, output_dim=10, dropout=0.0)
-key = random.key(seed)
-dummy_input = jnp.ones((1, 28, 28), dtype=jnp.float32)
-params = model.init(key, dummy_input, training=False)["params"]
 
+# 1. Initialize variables using a PRNG key and a dynamically sized dummy input
+dummy_input = jnp.ones((batch_size, 28, 28), dtype=jnp.float32)
+variables = model.init({"params": init_key, "dropout": drop_key}, dummy_input, training=False)
+
+# 2. Bundle params and optimizer into an immutable TrainState
 tx = optax.adam(learning_rate=0.001)
-state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+state = train_state.TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
+
 ```
 
 **Key differences:**
-- JAX requires explicit parameter initialization with dummy input
-- Parameters are separated from model architecture
-- Optimizer is created independently via `optax`
-- `TrainState` bundles optimizer state and parameters
+
+* PyTorch initializes weights under the hood during class instantiation.
+* JAX requires an explicit dummy input (sized correctly to your batch) to trace the graph and generate parameter shapes.
+* JAX explicitly separates the model architecture from the parameter state.
 
 ---
 
 ## 4. **Random Number Generation**
 
 ### PyTorch
+
 ```python
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
+torch.manual_seed(42) # Global state mutated
+
 ```
 
 ### JAX
+
 ```python
-key = random.key(seed)
-key, subkey = random.split(key)
-# Use subkey for operations, keep key for next iteration
+key = random.key(42)
+key, subkey = random.split(key) # Explicit functional splitting
+
 ```
 
 **Key differences:**
-- JAX uses explicit key passing (functional approach)
-- Must split keys for each random operation
-- No global random state
+
+* JAX has **no global random state**. You must explicitly pass and split PRNG keys for *every* random operation. For example, a new key must be split and passed to the model on every single training step to ensure Dropout masks are unique.
 
 ---
 
-## 5. **Training Loop**
+## 5. **Training Loop & JIT Compilation**
 
-### PyTorch (stateful, imperative)
+### PyTorch (Stateful, Imperative)
+
 ```python
 def train_one_epoch(model, loader, optimizer, loss_fn, device):
-    model.train()
+    model.train() # Set state
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
         loss = loss_fn(logits, y)
         
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        loss.backward() # Mutates gradients globally
+        optimizer.step() # Mutates weights
+
 ```
 
-### JAX (functional, pure)
-```python
-def train_step(state, model, x, y):
-    loss_value, grads = jax.value_and_grad(loss_fn)(state.params, model, x, y)
-    new_state = state.apply_gradients(grads=grads)
-    acc = accuracy(state.params, model, x, y)
-    return new_state, loss_value, acc
+### JAX (Functional, Compiled)
 
-def loss_fn(params, model, x, y):
-    logits = model.apply({"params": params}, x, training=True)
-    y_onehot = jax.nn.one_hot(y, num_classes=10)
-    loss = jnp.mean(optax.softmax_cross_entropy(logits, y_onehot))
-    return loss
-```
-
-**Key differences:**
-- JAX: loss function is explicit function of parameters
-- JAX uses `jax.value_and_grad()` to get loss AND gradients
-- PyTorch: backward pass modifies optimizer state in-place
-- JAX: returns new state (immutable)
-- No `zero_grad()` needed in JAX
-
----
-
-## 6. **JIT Compilation (JAX advantage)**
-
-### Pure JAX
 ```python
 @jax.jit
-def train_step(state, model, x, y):
-    loss_value, grads = jax.value_and_grad(loss_fn)(state.params, model, x, y)
-    new_state = state.apply_gradients(grads=grads)
-    return new_state, loss_value
+def train_step(state, x, y, dropout_key):
+    def loss_fn(params):
+        logits = state.apply_fn({"params": params}, x, training=True, rngs={"dropout": dropout_key})
+        y_onehot = jax.nn.one_hot(y, num_classes=10)
+        return jnp.mean(optax.softmax_cross_entropy(logits, y_onehot)), logits
 
-# Can batch vectorize
-train_step_batched = jax.vmap(train_step, in_axes=(None, None, 0, 0))
+    # Get loss AND gradients simultaneously
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    
+    # Return an entirely new state object
+    new_state = state.apply_gradients(grads=grads)
+    return new_state, loss
+
 ```
 
-**JAX can:**
-- JIT compile pure functions for speed
-- Automatically vectorize with `vmap`
-- Parallelize with `pmap`
-- Differentiate through differentiation (`grad(grad(...))`)
+**Key differences:**
+
+* The `@jax.jit` decorator compiles the entire `train_step` into an ultra-fast XLA executable.
+* PyTorch modifies the optimizer state in-place; JAX returns a mathematically new `TrainState`.
+* No `zero_grad()` is needed in JAX because gradients are calculated functionally as outputs.
 
 ---
 
-## 7. **Device Handling**
+## 6. **Device Handling (MPS & CUDA)**
+
+Both frameworks are configured in these templates to automatically detect your hardware.
+
+This means you can confidently prototype locally on Apple Silicon (using MPS for Mac) and seamlessly deploy the exact same scripts to CUDA-enabled workstations or gaming laptops for heavy training runs without modifying a single line of device-placement code.
 
 ### PyTorch
+
 ```python
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Custom fallback required
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 model = model.to(device)
 x = x.to(device)
+
 ```
 
 ### JAX
-```python
-device = jax.devices()[0].platform
-# JAX automatically uses available accelerators
-# No manual device placement needed
-```
 
-**Key differences:**
-- JAX handles devices implicitly
-- Arrays stay on current device automatically
-- More transparent to user
+```python
+# Fully automatic
+device = jax.devices()[0].platform 
+# JAX automatically places arrays on the fastest available accelerator
+
+```
 
 ---
 
-## 8. **Checkpointing**
-
-### PyTorch
-```python
-torch.save(model.state_dict(), "model.pt")
-model.load_state_dict(torch.load("model.pt"))
-```
-
-### JAX
-```python
-# Save parameters as numpy
-np.save("params.npy", params)
-
-# Load parameters
-params = np.load("params.npy", allow_pickle=True).item()
-```
-
-**Key differences:**
-- JAX checkpoints are just NumPy arrays (simpler, more portable)
-- No special serialization framework needed
-- Explicit parameter passing
-
----
-
-## 9. **Pros & Cons Summary**
+## 7. **Pros & Cons Summary**
 
 ### PyTorch Pros
-✅ Intuitive imperative syntax
-✅ Easy to debug (eager execution)
-✅ Large ecosystem, many pretrained models
-✅ Great for research & prototyping
-✅ Good documentation
+
+✅ Intuitive, Pythonic syntax (great for quick debugging).
+✅ Massive ecosystem and industry-standard for most research.
+✅ Eager execution makes printing tensor shapes mid-forward pass trivial.
 
 ### PyTorch Cons
-❌ Slower at scale without careful optimization
-❌ Harder to parallelize across devices
-❌ Mutation makes parallelization tricky
+
+❌ Eager mode has python overhead (though `torch.compile` is bridging this gap).
+❌ Mutating state makes complex parallelization trickier.
 
 ### JAX Pros
-✅ Composable transformations (grad, vmap, pmap)
-✅ JIT compilation for speed
-✅ Natural expression of math (NumPy-like)
-✅ Better for distributed computing
-✅ Pure functions are easier to reason about
+
+✅ First-class composable transformations (`vmap` is magic for custom training loops).
+✅ Extremely fast once compiled.
+✅ Functional purity makes massive distributed computing much safer.
 
 ### JAX Cons
-❌ Steeper learning curve (functional paradigm)
-❌ Key-based randomness requires discipline
-❌ Smaller ecosystem
-❌ Harder to debug (graph compilation)
-❌ More boilerplate code
 
----
-
-## 10. **Educational Takeaways**
-
-1. **Different Paradigms**: PyTorch is imperative; JAX is functional
-2. **State Management**: PyTorch mutates; JAX returns new values
-3. **Randomness**: JAX's explicit key passing prevents bugs
-4. **Composability**: JAX's transformations enable automatic differentiation, vectorization, parallelization
-5. **Speed**: JAX's JIT can be faster, but requires pure functions
-6. **Tradeoff**: JAX trades ease-of-use for power and composability
+❌ Steep learning curve.
+❌ Key-based randomness requires rigorous discipline (easy to accidentally reuse a dropout mask).
+❌ Harder to debug (you cannot just throw a `print()` inside a JIT-compiled function).
 
 ---
 
 ## Quick Command Reference
 
 | Task | PyTorch | JAX |
-|------|---------|-----|
+| --- | --- | --- |
 | Seed | `torch.manual_seed(42)` | `key = random.key(42)` |
-| Model init | `model = MLP(...)` | `params = model.init(...)` |
-| Forward pass | `logits = model(x)` | `logits = model.apply({"params": params}, x)` |
-| Gradients | `loss.backward()` | `grads = grad(loss_fn)(params)` |
+| Model init | `model = MLP(...)` | `variables = model.init(...)` |
+| Forward pass | `logits = model(x)` | `logits = state.apply_fn({"params": params}, x)` |
+| Gradients | `loss.backward()` | `grads = jax.grad(loss_fn)(params)` |
 | Optimizer step | `opt.step()` | `state = state.apply_gradients(grads)` |
-| JIT | N/A (eager) | `@jax.jit` decorator |
+| JIT | `torch.compile(model)` | `@jax.jit` decorator |
 | Vectorize | Manual batching | `jax.vmap(fn)` |
-| Save | `torch.save()` | `np.save()` |
 
 ---
 
 ## Running the Templates
 
+Ensure you have your virtual environment active and dependencies installed from the respective `requirements.txt` files.
+
 ### PyTorch
+
 ```bash
-pip install -r requirements.txt
 python pytorch_template.py
+
 ```
 
 ### JAX
-```bash
-pip install -r jax_requirements.txt
-python jax_template.py
-```
 
-Both should produce identical experiment structures (multiple runs, seeded for reproducibility, saved metrics).
+```bash
+python jax_template.py
+
+```
