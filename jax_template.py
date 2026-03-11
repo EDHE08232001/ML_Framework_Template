@@ -9,7 +9,7 @@ from typing import Dict, Tuple, Any
 
 import jax
 import jax.numpy as jnp
-from jax import random, grad, vmap
+from jax import random
 import flax.linen as nn
 from flax.training import train_state
 import optax
@@ -24,32 +24,24 @@ import numpy as np
 def seed_everything(seed: int):
     """
     Set seeds for reproducibility.
-    JAX uses key-based random generation.
     """
     np.random.seed(seed)
-    # JAX's PRNG is key-based; create a master key
     return random.key(seed)
 
 
 def get_device():
     """
-    Check available devices and return device type string.
-    JAX automatically uses available accelerators (GPU/TPU).
+    JAX automatically uses available accelerators (GPU/TPU/MPS).
     """
     devices = jax.devices()
-    device_type = devices[0].platform
-    return device_type
+    return devices[0].platform
 
 
 # =====================================================
 # 1.5) Memory Cleanup
 # =====================================================
 def cleanup():
-    """
-    Force garbage collection.
-    JAX is more efficient with memory than PyTorch,
-    but we can still explicitly clean up.
-    """
+    """Force garbage collection."""
     gc.collect()
 
 
@@ -58,7 +50,7 @@ def cleanup():
 # =====================================================
 class MLP(nn.Module):
     """
-    Multi-Layer Perceptron using Flax (JAX's neural network library).
+    Multi-Layer Perceptron using Flax.
     """
     input_dim: int = 784
     hidden_dim: int = 256
@@ -72,6 +64,7 @@ class MLP(nn.Module):
         x = nn.relu(x)
         
         if self.dropout > 0.0:
+            # Dropout in Flax requires an explicit PRNG collection during apply
             x = nn.Dropout(rate=self.dropout, deterministic=not training)(x)
         
         x = nn.Dense(self.output_dim)(x)
@@ -82,16 +75,12 @@ class MLP(nn.Module):
 # 3) Data Pipeline
 # =====================================================
 def make_loader(batch_size: int, key: jax.random.PRNGKey):
-    """
-    Load MNIST dataset and create batches.
-    """
+    """Load and batch MNIST data."""
     (x_train, y_train), _ = mnist.load_data()
     
-    # Normalize
     x_train = x_train.astype(np.float32) / 255.0
     y_train = y_train.astype(np.int32)
     
-    # Shuffle
     n = len(x_train)
     indices = np.arange(n)
     key, subkey = random.split(key)
@@ -100,7 +89,6 @@ def make_loader(batch_size: int, key: jax.random.PRNGKey):
     x_train = x_train[indices]
     y_train = y_train[indices]
     
-    # Create batches
     num_batches = n // batch_size
     x_batches = x_train[:num_batches * batch_size].reshape(
         num_batches, batch_size, 28, 28
@@ -113,42 +101,37 @@ def make_loader(batch_size: int, key: jax.random.PRNGKey):
 
 
 # =====================================================
-# 4) Training Step
+# 4) Training Step (Functional & JIT Compiled)
 # =====================================================
-def loss_fn(params, model, x, y):
+@jax.jit
+def train_step(state: train_state.TrainState, x, y, dropout_key):
     """
-    Compute cross-entropy loss.
+    Single training step. @jax.jit compiles this entire function 
+    into a highly optimized static XLA graph.
     """
-    logits = model.apply({"params": params}, x, training=True)
+    def loss_fn(params):
+        # We use state.apply_fn instead of passing the model object directly
+        logits = state.apply_fn(
+            {"params": params}, 
+            x, 
+            training=True,
+            rngs={"dropout": dropout_key} # Pass the dropout key here
+        )
+        y_onehot = jax.nn.one_hot(y, num_classes=10)
+        loss = jnp.mean(optax.softmax_cross_entropy(logits, y_onehot))
+        return loss, logits
+
+    # Compute loss and gradients simultaneously 
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss_value, logits), grads = grad_fn(state.params)
     
-    # One-hot encode labels
-    y_onehot = jax.nn.one_hot(y, num_classes=10)
-    
-    # Compute loss
-    loss = jnp.mean(
-        optax.softmax_cross_entropy(logits, y_onehot)
-    )
-    return loss
-
-
-def accuracy(params, model, x, y):
-    """
-    Compute accuracy.
-    """
-    logits = model.apply({"params": params}, x, training=False)
-    pred = jnp.argmax(logits, axis=1)
-    return jnp.mean(pred == y)
-
-
-def train_step(state, model, x, y):
-    """
-    Single training step with gradient update.
-    """
-    loss_value, grads = jax.value_and_grad(loss_fn)(
-        state.params, model, x, y
-    )
+    # Immutable update: returns a NEW state object
     new_state = state.apply_gradients(grads=grads)
-    acc = accuracy(state.params, model, x, y)
+    
+    # Calculate accuracy
+    pred = jnp.argmax(logits, axis=1)
+    acc = jnp.mean(pred == y)
+    
     return new_state, loss_value, acc
 
 
@@ -156,13 +139,8 @@ def train_step(state, model, x, y):
 # 5) One Full Experiment Run
 # =====================================================
 def run_experiment(cfg: Dict, run_id: int, seed: int):
-    """
-    Run a full training experiment.
-    """
     key = seed_everything(seed)
-    device = get_device()
     
-    # Create model
     model = MLP(
         input_dim=cfg["model"]["input_dim"],
         hidden_dim=cfg["model"]["hidden_dim"],
@@ -170,12 +148,21 @@ def run_experiment(cfg: Dict, run_id: int, seed: int):
         dropout=cfg["model"]["dropout"],
     )
     
-    # Initialize model parameters
-    key, subkey = random.split(key)
-    dummy_input = jnp.ones((1, 28, 28), dtype=jnp.float32)
-    params = model.init(subkey, dummy_input, training=False)["params"]
+    # We need multiple keys for parameter init vs. dropout init
+    key, init_key, dropout_init_key = random.split(key, 3)
     
-    # Create optimizer and training state
+    # FIX: Initialize dummy input with the actual batch size
+    batch_size = cfg["dataset"]["batch_size"]
+    dummy_input = jnp.ones((batch_size, 28, 28), dtype=jnp.float32)
+    
+    # Initialize the model weights
+    variables = model.init(
+        {"params": init_key, "dropout": dropout_init_key}, 
+        dummy_input, 
+        training=False
+    )
+    params = variables["params"]
+    
     tx = optax.adam(learning_rate=cfg["training"]["learning_rate"])
     state = train_state.TrainState.create(
         apply_fn=model.apply,
@@ -183,14 +170,10 @@ def run_experiment(cfg: Dict, run_id: int, seed: int):
         tx=tx
     )
     
-    # Load data
-    x_batches, y_batches, key = make_loader(
-        cfg["dataset"]["batch_size"], key
-    )
+    x_batches, y_batches, key = make_loader(batch_size, key)
     
     num_batches = len(x_batches)
-    steps_per_epoch = num_batches
-    total_steps = cfg["training"]["epochs"] * steps_per_epoch
+    total_steps = cfg["training"]["epochs"] * num_batches
     mid_step = total_steps // 2
     step = 0
     
@@ -206,7 +189,10 @@ def run_experiment(cfg: Dict, run_id: int, seed: int):
             x = x_batches[batch_idx]
             y = y_batches[batch_idx]
             
-            state, loss_value, acc = train_step(state, model, x, y)
+            # Split a new key at every single step to ensure unique dropout masks
+            key, step_dropout_key = random.split(key)
+            
+            state, loss_value, acc = train_step(state, x, y, step_dropout_key)
             
             log.append({
                 "step": step,
@@ -215,25 +201,13 @@ def run_experiment(cfg: Dict, run_id: int, seed: int):
             })
             
             if step == mid_step:
-                # Save checkpoint at midpoint
-                checkpoint = {"params": state.params}
-                with open(
-                    f"{cfg['paths']['checkpoints_dir']}/run{run_id}_mid.npy", 
-                    "wb"
-                ) as f:
-                    np.save(f, checkpoint["params"])
+                with open(f"{cfg['paths']['checkpoints_dir']}/run{run_id}_mid.npy", "wb") as f:
+                    np.save(f, state.params)
     
-    # Save final checkpoint
-    final_checkpoint = {"params": state.params}
-    with open(
-        f"{cfg['paths']['checkpoints_dir']}/run{run_id}_final.npy",
-        "wb"
-    ) as f:
-        np.save(f, final_checkpoint["params"])
+    with open(f"{cfg['paths']['checkpoints_dir']}/run{run_id}_final.npy", "wb") as f:
+        np.save(f, state.params)
     
-    # Cleanup
     cleanup()
-    
     return log
 
 
@@ -257,10 +231,8 @@ def main():
         log = run_experiment(cfg, run_id, seed)
         all_runs.append(log)
         
-        # Emergency cleanup between runs
         cleanup()
         
-        # Save run log
         out = os.path.join(cfg["paths"]["logs_dir"], f"run{run_id}.log")
         with open(out, "w") as f:
             f.write("step,loss,acc\n")
@@ -269,7 +241,6 @@ def main():
         
         print(f"  Saved to {out}\n")
     
-    # Aggregate results
     steps = len(all_runs[0])
     arr = np.zeros((len(all_runs), steps, 2), dtype=np.float32)
     
